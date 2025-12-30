@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  step-ca:
+    image: smallstep/step-ca:latest
+    container_name: step-ca
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - step-ca-data:/home/step
+      - ./certs:/certs
+    environment:
+      - DOCKER_STEPCA_INIT_NAME=AK-SG IoT CA
+      - DOCKER_STEPCA_INIT_DNS_NAMES=localhost,step-ca
+      - DOCKER_STEPCA_INIT_REMOTE_MANAGEMENT=true
+      - DOCKER_STEPCA_INIT_PROVISIONER_NAME=iot-devices
+    networks:
+      - pki-network
+
+  pki-gui:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    container_name: pki-gui
+    restart: unless-stopped
+    ports:
+      - "8502:8502"
+    volumes:
+      - step-ca-data:/home/step:ro
+      - ./certs:/app/certs
+    environment:
+      - STEP_CA_URL=https://step-ca:9000
+      - STEP_CA_ROOT=/home/step/certs/root_ca.crt
+      - STEP_CA_FINGERPRINT_FILE=/home/step/certs/root_ca.crt
+    depends_on:
+      - step-ca
+    networks:
+      - pki-network
+
+volumes:
+  step-ca-data:
+
+networks:
+  pki-network:
+    driver: bridge
