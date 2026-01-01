@@ -6,10 +6,10 @@ RUN apt-get update && apt-get install -y \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install step CLI
-RUN curl -fsSL https://github.com/smallstep/cli/releases/download/v0.27.2/step_linux_0.27.2_amd64.tar.gz -o /tmp/step.tar.gz && \
+# Install step CLI (match version with step-ca)
+RUN curl -fsSL https://github.com/smallstep/cli/releases/download/v0.29.0/step_linux_0.29.0_amd64.tar.gz -o /tmp/step.tar.gz && \
     tar -xzf /tmp/step.tar.gz -C /tmp && \
-    mv /tmp/step_0.27.2/bin/step /usr/local/bin/step && \
+    mv /tmp/step_0.29.0/bin/step /usr/local/bin/step && \
     chmod +x /usr/local/bin/step && \
     rm -rf /tmp/step*
 

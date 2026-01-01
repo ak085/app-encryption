@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   step-ca:
     image: smallstep/step-ca:latest
@@ -15,6 +13,7 @@ services:
       - DOCKER_STEPCA_INIT_DNS_NAMES=localhost,step-ca
       - DOCKER_STEPCA_INIT_REMOTE_MANAGEMENT=true
       - DOCKER_STEPCA_INIT_PROVISIONER_NAME=iot-devices
+      - DOCKER_STEPCA_INIT_PASSWORD=changeme123
     networks:
       - pki-network
 

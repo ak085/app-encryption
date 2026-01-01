@@ -58,8 +58,8 @@ Private PKI infrastructure for IoT MQTT mTLS authentication using step-ca.
 │  Site-001, Site-002, ... Site-N                                              │
 │                                                                              │
 │  Each site has:                                                              │
-│  ├── ca.crt          (CA root certificate - to verify EMQX)                  │
-│  ├── site-XXX.crt    (Client certificate - identity)                         │
+│  ├── ca.crt          (CA bundle: intermediate + root CAs)                    │
+│  ├── site-XXX.crt    (Client cert chain: leaf + intermediate)                │
 │  └── site-XXX.key    (Private key - keep secure)                             │
 │                                                                              │
 │  Mosquitto bridge connects to HAProxy:8883 with mTLS                         │
@@ -72,8 +72,12 @@ Private PKI infrastructure for IoT MQTT mTLS authentication using step-ca.
 
 ```
 ┌─────────────────────────────────┐
-│     AK-SG IoT CA (Root)         │  ◄── Self-signed, stored in step-ca
-│     Fingerprint: abc123...      │
+│     AK-SG IoT CA Root CA        │  ◄── Self-signed root
+└───────────────┬─────────────────┘
+                │ Signs
+                ▼
+┌─────────────────────────────────┐
+│  AK-SG IoT CA Intermediate CA   │  ◄── Issues all certs
 └───────────────┬─────────────────┘
                 │ Signs
         ┌───────┴───────┐
@@ -84,6 +88,19 @@ Private PKI infrastructure for IoT MQTT mTLS authentication using step-ca.
 │ (for EMQX)    │ │ (for device)  │
 └───────────────┘ └───────────────┘
 ```
+
+### Important: CA Bundle for mTLS
+
+For mTLS to work, the `ca.crt` file must contain **both** Intermediate CA and Root CA:
+
+```
+ca.crt (bundle):
+├── Intermediate CA   ← Verifies client/server certs
+└── Root CA           ← Verifies intermediate CA
+```
+
+Certificate files (`.crt`) issued by the GUI already include the chain (leaf + intermediate).
+The CA bundle is automatically created at `/home/step/certs/ca-bundle.crt`.
 
 ### mTLS Handshake Flow
 
@@ -148,6 +165,8 @@ DOCKER_STEPCA_INIT_PROVISIONER_NAME: "iot-devices"
 
 ### 2. Streamlit GUI (pki-gui)
 
+**step CLI version:** 0.29.0 (must match step-ca version for compatibility)
+
 **How it interacts with step-ca:**
 
 The GUI uses `subprocess.run()` to execute step CLI commands:
@@ -165,8 +184,9 @@ def run_step_command(args: list) -> subprocess.CompletedProcess:
 | Operation | step CLI Command |
 |-----------|-----------------|
 | Check CA health | `step ca health --ca-url URL --root CA_CERT` |
-| Issue certificate | `step ca certificate CN cert.crt key.key --provisioner iot-devices` |
-| Revoke certificate | `step ca revoke --cert cert.crt --key key.key` |
+| Issue certificate | `step ca certificate CN cert.crt key.key --provisioner iot-devices --not-after 720h` |
+| Generate revoke token | `step ca token <serial> --revoke --provisioner iot-devices` |
+| Revoke certificate | `step ca revoke <serial> --token <token>` |
 | Get fingerprint | `step certificate fingerprint root_ca.crt` |
 | Inspect certificate | `step certificate inspect cert.crt` |
 
@@ -213,7 +233,9 @@ certs/
 - Displays table with CN, issued date, expiry, status
 
 ### Revoke Certificate
-- Calls `step ca revoke` with cert and key
+- Uses token-based authentication (not mTLS) to avoid intermediate CA verification issues
+- Generates revocation token: `step ca token <serial> --revoke --provisioner iot-devices`
+- Revokes with token: `step ca revoke <serial> --token <token>`
 - Renames directory to `{CN}.revoked` to mark as revoked
 
 ### CA Settings
@@ -227,6 +249,17 @@ step-ca uses provisioners to authorize certificate requests.
 
 **Provisioner:** `iot-devices` (JWK type)
 **Password file:** `/home/step/secrets/password` (auto-generated)
+
+**Provisioner settings (configured for IoT use):**
+- Max certificate duration: 8760h (1 year)
+- Default certificate duration: 720h (30 days)
+
+To update provisioner settings:
+```bash
+docker compose exec step-ca step ca provisioner update iot-devices \
+  --x509-max-dur=8760h \
+  --x509-default-dur=720h
+```
 
 The GUI reads this password file to authenticate certificate operations:
 ```python

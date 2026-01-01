@@ -17,6 +17,8 @@ from cryptography.hazmat.backends import default_backend
 # Configuration
 STEP_CA_URL = os.environ.get("STEP_CA_URL", "https://step-ca:9000")
 STEP_CA_ROOT = os.environ.get("STEP_CA_ROOT", "/home/step/certs/root_ca.crt")
+# CA bundle includes intermediate + root for mTLS client verification
+CA_BUNDLE = "/home/step/certs/ca-bundle.crt"
 CERTS_DIR = Path("/app/certs")
 PROVISIONER_PASSWORD_FILE = "/home/step/secrets/password"
 
@@ -132,8 +134,8 @@ def issue_certificate(
                 files["cert"] = f.read()
             with open(key_file, "r") as f:
                 files["key"] = f.read()
-            with open(STEP_CA_ROOT, "r") as f:
-                files["ca"] = f.read()
+            with open(CA_BUNDLE, "r") as f:
+                files["ca"] = f.read()  # Includes intermediate + root for mTLS
             return True, "Certificate issued successfully", files
         except Exception as e:
             return False, f"Error reading files: {e}", {}
@@ -158,7 +160,7 @@ def list_certificates() -> list:
                         "cn": cert_dir.name,
                         "issued": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M"),
                         "expires": cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M"),
-                        "serial": format(cert.serial_number, "x"),
+                        "serial": str(cert.serial_number),  # Decimal format for step CLI
                         "status": "Active" if cert.not_valid_after_utc > datetime.now(cert.not_valid_after_utc.tzinfo) else "Expired"
                     })
                 except Exception as e:
@@ -174,27 +176,57 @@ def list_certificates() -> list:
 
 
 def revoke_certificate(common_name: str, serial: str) -> tuple[bool, str]:
-    """Revoke a certificate by serial number."""
+    """Revoke a certificate by serial number using token-based auth."""
     cert_file = CERTS_DIR / common_name / f"{common_name}.crt"
 
     if not cert_file.exists():
         return False, "Certificate file not found"
 
-    cmd = [
-        "ca", "revoke",
+    # Step 1: Generate a revocation token using provisioner
+    # Note: subject (serial) must come before flags
+    token_cmd = [
+        "ca", "token",
+        serial,
+        "--revoke",
         "--ca-url", STEP_CA_URL,
         "--root", STEP_CA_ROOT,
-        "--cert", str(cert_file),
-        "--key", str(CERTS_DIR / common_name / f"{common_name}.key"),
+        "--provisioner", "iot-devices",
         "--provisioner-password-file", PROVISIONER_PASSWORD_FILE
     ]
 
-    result = run_step_command(cmd)
+    token_result = run_step_command(token_cmd)
+    if token_result.returncode != 0:
+        return False, f"Failed to generate revocation token: {token_result.stderr}"
 
-    if result.returncode == 0:
+    token = token_result.stdout.strip()
+
+    # Step 2: Revoke using the token
+    revoke_cmd = [
+        "ca", "revoke",
+        serial,
+        "--ca-url", STEP_CA_URL,
+        "--root", STEP_CA_ROOT,
+        "--token", token
+    ]
+
+    result = run_step_command(revoke_cmd)
+
+    # Check if already revoked (still counts as success for cleanup)
+    already_revoked = "already revoked" in result.stderr.lower()
+
+    if result.returncode == 0 or already_revoked:
         # Mark as revoked by renaming directory
         revoked_dir = CERTS_DIR / f"{common_name}.revoked"
-        (CERTS_DIR / common_name).rename(revoked_dir)
+        # Handle case where .revoked already exists
+        if revoked_dir.exists():
+            import shutil
+            shutil.rmtree(revoked_dir)
+        try:
+            (CERTS_DIR / common_name).rename(revoked_dir)
+        except Exception as e:
+            pass  # Directory rename failed but cert is revoked
+        if already_revoked:
+            return True, "Certificate was already revoked. Cleaned up local files."
         return True, "Certificate revoked successfully"
     else:
         return False, f"Error: {result.stderr}"
@@ -281,7 +313,7 @@ if page == "Dashboard":
     if certs:
         st.dataframe(
             certs[:10],
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
     else:
@@ -290,6 +322,12 @@ if page == "Dashboard":
 # Issue Certificate page
 elif page == "Issue Certificate":
     st.header("Issue New Certificate")
+
+    # Initialize session state for certificate data
+    if "cert_bundle" not in st.session_state:
+        st.session_state.cert_bundle = None
+        st.session_state.cert_name = None
+        st.session_state.cert_files = None
 
     with st.form("issue_cert_form"):
         common_name = st.text_input(
@@ -322,8 +360,8 @@ elif page == "Issue Certificate":
         if submitted:
             if not common_name:
                 st.error("Please enter a site/device name")
-            elif not common_name.replace("-", "").replace("_", "").isalnum():
-                st.error("Name should only contain letters, numbers, hyphens, and underscores")
+            elif not common_name.replace("-", "").replace("_", "").replace(".", "").isalnum():
+                st.error("Name should only contain letters, numbers, hyphens, underscores, and dots")
             else:
                 with st.spinner("Generating certificate..."):
                     sans = []
@@ -336,27 +374,40 @@ elif page == "Issue Certificate":
 
                     if success:
                         st.success(message)
-
-                        # Create download bundle
-                        bundle = create_cert_bundle(common_name, files)
-
-                        st.download_button(
-                            label="Download Certificate Bundle (ZIP)",
-                            data=bundle,
-                            file_name=f"{common_name}-certs.zip",
-                            mime="application/zip",
-                            type="primary"
-                        )
-
-                        # Show individual files
-                        with st.expander("View Certificate Files"):
-                            st.code(files["cert"], language="text")
-                            st.caption("Certificate")
-
-                            st.code(files["ca"], language="text")
-                            st.caption("CA Certificate")
+                        # Store in session state for download button outside form
+                        st.session_state.cert_bundle = create_cert_bundle(common_name, files)
+                        st.session_state.cert_name = common_name
+                        st.session_state.cert_files = files
                     else:
                         st.error(message)
+                        st.session_state.cert_bundle = None
+
+    # Download button outside the form
+    if st.session_state.cert_bundle is not None:
+        st.divider()
+        st.subheader("Download Certificate")
+
+        st.download_button(
+            label=f"Download {st.session_state.cert_name} Bundle (ZIP)",
+            data=st.session_state.cert_bundle,
+            file_name=f"{st.session_state.cert_name}-certs.zip",
+            mime="application/zip",
+            type="primary"
+        )
+
+        # Show individual files
+        with st.expander("View Certificate Files"):
+            st.code(st.session_state.cert_files["cert"], language="text")
+            st.caption("Certificate")
+
+            st.code(st.session_state.cert_files["ca"], language="text")
+            st.caption("CA Certificate")
+
+        if st.button("Clear"):
+            st.session_state.cert_bundle = None
+            st.session_state.cert_name = None
+            st.session_state.cert_files = None
+            st.rerun()
 
 # View Certificates page
 elif page == "View Certificates":
@@ -376,7 +427,7 @@ elif page == "View Certificates":
 
         st.dataframe(
             certs,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "cn": st.column_config.TextColumn("Common Name", width="medium"),
@@ -443,21 +494,21 @@ elif page == "CA Settings":
         st.text_input("Provisioner", value="iot-devices", disabled=True)
 
     with col2:
-        st.subheader("Download CA Certificate")
+        st.subheader("Download CA Certificate Bundle")
 
         try:
-            with open(STEP_CA_ROOT, "r") as f:
+            with open(CA_BUNDLE, "r") as f:
                 ca_cert = f.read()
 
             st.download_button(
-                label="Download CA Certificate",
+                label="Download CA Bundle (Intermediate + Root)",
                 data=ca_cert,
                 file_name="ca.crt",
                 mime="application/x-pem-file",
                 type="primary"
             )
 
-            st.caption("Install this CA certificate on all devices that need to verify certificates issued by this CA.")
+            st.caption("This bundle includes Intermediate CA + Root CA. Required for mTLS client verification.")
 
             with st.expander("View CA Certificate"):
                 st.code(ca_cert, language="text")
